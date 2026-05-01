@@ -1,0 +1,10 @@
+# Scraper outputs
+competitor_data.json
+scraper.log
+
+# Python system files
+__pycache__/
+*.pyc
+
+# Environment variables (Safety first!)
+.env

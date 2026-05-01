@@ -1,309 +1,258 @@
 import asyncio
-import csv
 import json
-import os
-import re
-from datetime import date
+import logging
 from pathlib import Path
 from urllib.parse import urljoin
 
-import aiohttp
+import pandas as pd
+import requests
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-BASE_URL = "https://homestra.com/list/houses-for-sale/norway/?property-type=house"
-CSV_PATH = Path("listings.csv")
-API_CLEAN_URL = "http://127.0.0.1:5000/clean"
-MAX_LISTINGS = 10
+BASE_URL = "https://books.toscrape.com/"
+WEBHOOK_URL = "https://hook.eu1.make.com/lct2apf0fzkpfhtsxpz28wc6433apian"
+OUTPUT_FILE = Path("competitor_data.json")
+LOG_FILE = Path("scraper.log")
+PRODUCT_LIMIT = 10
+MAX_NAVIGATION_ATTEMPTS = 3
+NAVIGATION_TIMEOUT_MS = 60_000
+REQUEST_TIMEOUT_SECONDS = 30
+BOLD_GREEN = "\033[1;32m"
+BOLD_CYAN = "\033[1;36m"
+BOLD_MAGENTA = "\033[1;35m"
+RESET_STYLE = "\033[0m"
 
 
-def regex_clean_price(price_text: str) -> int | None:
-    if not price_text:
-        return None
+def configure_logging() -> logging.Logger:
+    """Configure structured console and file logging."""
+    logger = logging.getLogger("books_scraper")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
 
-    cleaned = re.findall(r"\d[\d,]*", price_text)
-    if not cleaned:
-        return None
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-    normalized = cleaned[0].replace(",", "")
-    try:
-        return int(normalized)
-    except ValueError:
-        return None
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
 
+    file_handler = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+    file_handler.setFormatter(formatter)
 
-async def clean_price(price_text: str) -> int | None:
-    if not price_text:
-        return None
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                API_CLEAN_URL, json={"price": price_text}, timeout=5
-            ) as response:
-                if response.status == 200:
-                    payload = await response.json()
-                    if isinstance(payload, dict):
-                        for key in ("clean_price", "price_clean", "cleaned", "value"):
-                            if key in payload:
-                                return int(payload[key])
-                        if "price" in payload and isinstance(
-                            payload["price"], (int, float, str)
-                        ):
-                            return int(payload["price"])
-                    if isinstance(payload, (int, float, str)):
-                        return int(payload)
-
-    except Exception:
-        pass
-
-    return regex_clean_price(price_text)
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    return logger
 
 
-def get_existing_scrape_date() -> str | None:
-    if not CSV_PATH.exists():
-        return None
-
-    try:
-        with CSV_PATH.open("r", newline="", encoding="utf-8") as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                return row.get("scrape_date")
-    except Exception:
-        return None
-
-    return None
+logger = configure_logging()
 
 
-def write_listings(rows: list[dict[str, str]]) -> None:
-    today = date.today().isoformat()
-    current_date = get_existing_scrape_date()
-    write_header = current_date != today
-    mode = "a" if not write_header and CSV_PATH.exists() else "w"
-
-    with CSV_PATH.open(mode, newline="", encoding="utf-8") as csvfile:
-        fieldnames = ["scrape_date", "title", "price_raw", "price_clean", "link"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        if mode == "w":
-            writer.writeheader()
-        for row in rows:
-            writer.writerow(
-                {
-                    "scrape_date": today,
-                    "title": row.get("title", ""),
-                    "price_raw": row.get("price_raw", ""),
-                    "price_clean": row.get("price_clean", ""),
-                    "link": row.get("link", ""),
-                }
-            )
-
-    if mode == "w":
-        print(f"Wrote {len(rows)} listings to {CSV_PATH}.")
-    else:
-        print(f"Appended {len(rows)} listings to {CSV_PATH}.")
+def print_status(message: str, color: str = BOLD_CYAN) -> None:
+    """Print high-visibility terminal feedback."""
+    print(f"{color}{message}{RESET_STYLE}", flush=True)
 
 
-async def extract_text(locator) -> str | None:
-    try:
-        text = await locator.inner_text()
-        if text:
-            return text.strip()
-    except Exception:
-        pass
-    return None
+async def extract_products(page) -> list[dict[str, str]]:
+    """Extract raw product data from the current page."""
+    products: list[dict[str, str]] = []
+    product_cards = page.locator("article.product_pod")
+    product_count = min(await product_cards.count(), PRODUCT_LIMIT)
 
+    logger.info(
+        "Found %s product cards; extracting first %s",
+        await product_cards.count(),
+        product_count,
+    )
 
-async def extract_listing_data(listing) -> dict[str, str | None]:
-    selectors = [
-        "h2",
-        "h3",
-        "a",
-        ".title",
-        ".property-title",
-        ".listing-title",
-        ".card-title",
-        ".name",
-        "span",
-        "p",
-    ]
-    title = None
-    for selector in selectors:
-        candidate = listing.locator(selector)
-        if await candidate.count() > 0:
-            value = await extract_text(candidate.first)
-            if value:
-                title = value
-                break
+    for index in range(product_count):
+        card = product_cards.nth(index)
 
-    price_selectors = [
-        ".price",
-        ".listing-price",
-        ".property-price",
-        "span.price",
-        "strong",
-        "p",
-    ]
-    price = None
-    for selector in price_selectors:
-        candidate = listing.locator(selector)
-        if await candidate.count() > 0:
-            value = await extract_text(candidate.first)
-            if value and re.search(r"\d", value):
-                price = value
-                break
+        try:
+            title_link = card.locator("h3 a")
+            title = (await title_link.get_attribute("title") or "").strip()
+            relative_url = await title_link.get_attribute("href")
+            price = (await card.locator(".price_color").inner_text()).strip()
+            availability_text = (
+                await card.locator(".availability").inner_text()
+            ).strip()
 
-    link = None
-    try:
-        anchor = listing.locator("a[href]")
-        if await anchor.count() > 0:
-            href = await anchor.first.get_attribute("href")
-            if href:
-                link = urljoin(BASE_URL, href)
-    except Exception:
-        pass
+            if not title:
+                raise ValueError("Missing product title")
+            if not relative_url:
+                raise ValueError(f"Missing product URL for {title}")
 
-    if not link:
-        link = BASE_URL
-
-    return {
-        "title": title or "Unknown Title",
-        "price_raw": price or "Unknown Price",
-        "link": link,
-    }
-
-
-async def extract_listings_from_next_data(page) -> list[dict[str, str]]:
-    try:
-        script = page.locator("script#__NEXT_DATA__")
-        if await script.count() == 0:
-            return []
-
-        payload = await script.first.inner_text()
-        data = json.loads(payload)
-        apollo = data.get("props", {}).get("pageProps", {}).get("__APOLLO_STATE__", {})
-        root = apollo.get("ROOT_QUERY", {})
-        search_key = next(
-            (key for key in root if key.startswith("listSearch(")),
-            None,
-        )
-        if not search_key:
-            return []
-
-        items = root.get(search_key, {}).get("items", [])
-        listings: list[dict[str, str]] = []
-        for item in items[:MAX_LISTINGS]:
-            ref = item.get("__ref") if isinstance(item, dict) else None
-            if not isinstance(ref, str):
-                continue
-
-            property_data = apollo.get(ref, {})
-            if not isinstance(property_data, dict):
-                continue
-
-            title = (
-                property_data.get("title")
-                or property_data.get("address")
-                or property_data.get("slug")
-                or property_data.get("city")
-                or "Unknown Title"
-            )
-            price = property_data.get("price")
-            price_raw = str(int(price)) if isinstance(price, (int, float)) else "Unknown Price"
-            slug = property_data.get("slug")
-            link = (
-                urljoin("https://homestra.com", f"/property/{slug}/")
-                if isinstance(slug, str)
-                else BASE_URL
-            )
-            listings.append(
+            products.append(
                 {
                     "title": title,
-                    "price_raw": price_raw,
-                    "price_clean": int(price) if isinstance(price, (int, float)) else "",
-                    "link": link,
+                    "price": price,
+                    "availability": normalize_availability(availability_text),
+                    "product_url": urljoin(BASE_URL, relative_url),
                 }
             )
+            logger.info("Extracted product %s/%s: %s", index + 1, product_count, title)
 
-        return listings
-    except Exception:
-        return []
+        except Exception as exc:
+            logger.exception("Failed to extract product at index %s: %s", index, exc)
+
+    return products
 
 
-async def scrape_listings() -> list[dict[str, str]]:
+def normalize_availability(value: str) -> str:
+    """Normalize availability text to the requested output labels."""
+    return "In Stock" if "in stock" in value.lower() else "Out of Stock"
+
+
+def clean_with_pandas(products: list[dict[str, str]]) -> pd.DataFrame:
+    """Clean raw scraped data with Pandas and return the final DataFrame."""
+    df = pd.DataFrame(
+        products, columns=["title", "price", "availability", "product_url"]
+    )
+
+    if df.empty:
+        logger.warning(
+            "No products were extracted; output JSON will contain an empty list"
+        )
+        return df
+
+    df["price"] = (
+        df["price"]
+        .astype(str)
+        .str.replace(r"[^\d.]+", "", regex=True)
+        .str.strip()
+        .pipe(pd.to_numeric, errors="coerce")
+    )
+
+    invalid_prices = df["price"].isna().sum()
+    if invalid_prices:
+        logger.warning(
+            "Detected %s product(s) with invalid prices after cleaning", invalid_prices
+        )
+
+    return df
+
+
+async def navigate_with_retries(page) -> None:
+    """Load the target page, retrying transient navigation failures."""
+    for attempt in range(1, MAX_NAVIGATION_ATTEMPTS + 1):
+        try:
+            logger.info(
+                "Navigating to %s (attempt %s/%s)",
+                BASE_URL,
+                attempt,
+                MAX_NAVIGATION_ATTEMPTS,
+            )
+            await page.goto(
+                BASE_URL, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS
+            )
+            await page.wait_for_selector(
+                "article.product_pod", timeout=NAVIGATION_TIMEOUT_MS
+            )
+            return
+        except PlaywrightTimeoutError as exc:
+            if attempt == MAX_NAVIGATION_ATTEMPTS:
+                logger.exception(
+                    "Timed out while loading %s after %s attempts: %s",
+                    BASE_URL,
+                    attempt,
+                    exc,
+                )
+                raise
+
+            logger.warning(
+                "Navigation attempt %s/%s timed out; retrying: %s",
+                attempt,
+                MAX_NAVIGATION_ATTEMPTS,
+                exc,
+            )
+            await asyncio.sleep(2 * attempt)
+        except Exception as exc:
+            if attempt == MAX_NAVIGATION_ATTEMPTS:
+                logger.exception(
+                    "Navigation failed for %s after %s attempts: %s",
+                    BASE_URL,
+                    attempt,
+                    exc,
+                )
+                raise
+
+            logger.warning(
+                "Navigation attempt %s/%s failed; retrying: %s",
+                attempt,
+                MAX_NAVIGATION_ATTEMPTS,
+                exc,
+            )
+            await asyncio.sleep(2 * attempt)
+
+
+async def scrape_books() -> pd.DataFrame:
+    """Navigate to the target site, scrape products, and return cleaned data."""
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         page = await browser.new_page()
-        print(f"Navigating to {BASE_URL}...")
-        await page.goto(BASE_URL, wait_until="networkidle", timeout=45000)
-        await page.wait_for_timeout(3000)
 
-        rows = await extract_listings_from_next_data(page)
-        if rows:
-            print(f"Found {len(rows)} listings via JSON data.")
+        try:
+            await navigate_with_retries(page)
+            raw_products = await extract_products(page)
+            return clean_with_pandas(raw_products)
+        finally:
             await browser.close()
-            return rows
-
-        card_selector = ", ".join(
-            [
-                "article",
-                ".listing-card",
-                ".property-card",
-                ".listing",
-                ".property",
-                ".home-card",
-                ".result-card",
-                "[data-testid='listing-card']",
-            ]
-        )
-        locator = page.locator(card_selector)
-        total = await locator.count()
-        if total == 0:
-            print(
-                "No listing cards found with default selectors. Trying fallback selectors..."
-            )
-            locator = page.locator(
-                "li, div[data-testid='property-card'], div[class*='listing']"
-            )
-            total = await locator.count()
-
-        row_count = min(total, MAX_LISTINGS)
-        print(f"Found {total} listing candidates, scraping first {row_count}.")
-
-        rows = []
-        for index in range(row_count):
-            element = locator.nth(index)
-            record = await extract_listing_data(element)
-            record["price_clean"] = await clean_price(record["price_raw"])
-            rows.append(
-                {
-                    "title": record["title"],
-                    "price_raw": record["price_raw"],
-                    "price_clean": (
-                        record["price_clean"]
-                        if record["price_clean"] is not None
-                        else ""
-                    ),
-                    "link": record["link"],
-                }
-            )
-
-        await browser.close()
-        return rows
+            logger.info("Browser closed")
 
 
-async def run_scraper() -> None:
-    print("Starting scrape job...")
+def send_to_webhook(json_path: Path) -> int:
+    """Send the generated JSON payload to the configured Make.com webhook."""
     try:
-        rows = await scrape_listings()
-        if rows:
-            write_listings(rows)
-        else:
-            print("No data scraped.")
-    except Exception as exc:
-        print(f"Scraper error: {exc}")
+        with json_path.open("r", encoding="utf-8") as input_file:
+            payload = json.load(input_file)
+
+        record_count = len(payload) if isinstance(payload, list) else 1
+        logger.info("Posting %s record(s) to Make.com webhook", record_count)
+
+        response = requests.post(
+            WEBHOOK_URL,
+            json=payload,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            raise requests.HTTPError(
+                f"Unexpected webhook status code: {response.status_code}",
+                response=response,
+            )
+
+        logger.info("Webhook POST succeeded with status code %s", response.status_code)
+        return response.status_code
+    except requests.RequestException as exc:
+        logger.exception("Webhook POST failed: %s", exc)
+        raise
+    except OSError as exc:
+        logger.exception("Could not read JSON file for webhook delivery: %s", exc)
+        raise
+    except json.JSONDecodeError as exc:
+        logger.exception("Generated JSON file is invalid and was not sent: %s", exc)
+        raise
 
 
 async def main() -> None:
-    await run_scraper()
+    """Run the scraper, save cleaned data to JSON, and send it to the webhook."""
+    try:
+        df = await scrape_books()
+        print_status(f"✅ Data extraction complete: {len(df)} items found.", BOLD_GREEN)
+
+        with OUTPUT_FILE.open("w", encoding="utf-8") as output_file:
+            json.dump(
+                df.to_dict(orient="records"), output_file, ensure_ascii=False, indent=2
+            )
+        logger.info("Saved %s cleaned product records to %s", len(df), OUTPUT_FILE)
+
+        status_code = send_to_webhook(OUTPUT_FILE)
+        if status_code == 200:
+            print_status("🚀 Data successfully synced", BOLD_CYAN)
+
+        print_status("✨ Automation Job Finished Successfully.", BOLD_MAGENTA)
+    except Exception:
+        logger.exception("Scraper failed")
+        raise
 
 
 if __name__ == "__main__":
