@@ -133,9 +133,9 @@ The scraper now reads secrets from [.env](</C:/Users/ahmad/Documents/competitor-
 
 ## 👤 Contact
 
-**Name:** Ahmed [Your Last Name]  
-**Portfolio:** [https://your-portfolio-link.com](https://your-portfolio-link.com)  
-**Email:** your-email@example.com
+**Name:** Ahmed Salis 
+**Portfolio:** https://www.upwork.com/freelancers/~0115ececdaa1168699
+**Email:** ahmadsalis338@gmail.com
 
 ## 📌 Positioning
 
