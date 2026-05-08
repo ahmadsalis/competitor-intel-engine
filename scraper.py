@@ -1,18 +1,25 @@
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from urllib.parse import urljoin
 
 import pandas as pd
 import requests
+try:
+    from dotenv import load_dotenv
+except ImportError as exc:
+    raise RuntimeError(
+        "Missing dependency 'python-dotenv'. Install it with 'pip install -r requirements.txt'."
+    ) from exc
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-BASE_URL = "https://books.toscrape.com/"
-WEBHOOK_URL = "https://hook.eu1.make.com/lct2apf0fzkpfhtsxpz28wc6433apian"
-OUTPUT_FILE = Path("competitor_data.json")
-LOG_FILE = Path("scraper.log")
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+CONFIG_FILE = BASE_DIR / "config.json"
+LOG_FILE = BASE_DIR / "scraper.log"
 PRODUCT_LIMIT = 10
 MAX_NAVIGATION_ATTEMPTS = 3
 NAVIGATION_TIMEOUT_MS = 60_000
@@ -21,6 +28,53 @@ BOLD_GREEN = "\033[1;32m"
 BOLD_CYAN = "\033[1;36m"
 BOLD_MAGENTA = "\033[1;35m"
 RESET_STYLE = "\033[0m"
+
+
+def load_settings(config_path: Path) -> dict[str, object]:
+    """Load required user-adjustable settings from config.json."""
+    try:
+        with config_path.open("r", encoding="utf-8") as config_file:
+            settings = json.load(config_file)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Missing configuration file: {config_path.name}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON in configuration file: {config_path.name}") from exc
+
+    required_keys = ("target_url", "scroll_count", "output_file_name", "webhook_url")
+    missing_keys = [key for key in required_keys if key not in settings]
+    if missing_keys:
+        missing = ", ".join(missing_keys)
+        raise RuntimeError(f"Missing required config value(s): {missing}")
+
+    if not isinstance(settings["target_url"], str) or not settings["target_url"].strip():
+        raise RuntimeError("Config value 'target_url' must be a non-empty string")
+    if not isinstance(settings["webhook_url"], str) or not settings["webhook_url"].strip():
+        raise RuntimeError("Config value 'webhook_url' must be a non-empty string")
+    if not isinstance(settings["output_file_name"], str) or not settings["output_file_name"].strip():
+        raise RuntimeError("Config value 'output_file_name' must be a non-empty string")
+    if not isinstance(settings["scroll_count"], int) or settings["scroll_count"] < 0:
+        raise RuntimeError("Config value 'scroll_count' must be a non-negative integer")
+
+    return settings
+
+
+def get_required_env(name: str) -> str:
+    """Read a required environment variable after loading .env."""
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+load_dotenv(ENV_FILE)
+SETTINGS = load_settings(CONFIG_FILE)
+TARGET_URL = SETTINGS["target_url"]
+SCROLL_COUNT = SETTINGS["scroll_count"]
+WEBHOOK_URL = SETTINGS["webhook_url"]
+OUTPUT_FILE = BASE_DIR / SETTINGS["output_file_name"]
+MAKE_API_KEY = get_required_env("MAKE_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+PYTHONANYWHERE_SECRET_KEY = os.getenv("PYTHONANYWHERE_SECRET_KEY", "")
 
 
 def configure_logging() -> logging.Logger:
@@ -51,6 +105,14 @@ logger = configure_logging()
 def print_status(message: str, color: str = BOLD_CYAN) -> None:
     """Print high-visibility terminal feedback."""
     print(f"{color}{message}{RESET_STYLE}", flush=True)
+
+
+async def apply_scroll(page, scroll_count: int) -> None:
+    """Scroll the page when a target site requires lazy-loaded content."""
+    for scroll_index in range(scroll_count):
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(500)
+        logger.info("Completed scroll %s/%s", scroll_index + 1, scroll_count)
 
 
 async def extract_products(page) -> list[dict[str, str]]:
@@ -87,7 +149,7 @@ async def extract_products(page) -> list[dict[str, str]]:
                     "title": title,
                     "price": price,
                     "availability": normalize_availability(availability_text),
-                    "product_url": urljoin(BASE_URL, relative_url),
+                    "product_url": urljoin(TARGET_URL, relative_url),
                 }
             )
             logger.info("Extracted product %s/%s: %s", index + 1, product_count, title)
@@ -138,12 +200,12 @@ async def navigate_with_retries(page) -> None:
         try:
             logger.info(
                 "Navigating to %s (attempt %s/%s)",
-                BASE_URL,
+                TARGET_URL,
                 attempt,
                 MAX_NAVIGATION_ATTEMPTS,
             )
             await page.goto(
-                BASE_URL, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS
+                TARGET_URL, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS
             )
             await page.wait_for_selector(
                 "article.product_pod", timeout=NAVIGATION_TIMEOUT_MS
@@ -153,7 +215,7 @@ async def navigate_with_retries(page) -> None:
             if attempt == MAX_NAVIGATION_ATTEMPTS:
                 logger.exception(
                     "Timed out while loading %s after %s attempts: %s",
-                    BASE_URL,
+                    TARGET_URL,
                     attempt,
                     exc,
                 )
@@ -170,7 +232,7 @@ async def navigate_with_retries(page) -> None:
             if attempt == MAX_NAVIGATION_ATTEMPTS:
                 logger.exception(
                     "Navigation failed for %s after %s attempts: %s",
-                    BASE_URL,
+                    TARGET_URL,
                     attempt,
                     exc,
                 )
@@ -193,6 +255,7 @@ async def scrape_books() -> pd.DataFrame:
 
         try:
             await navigate_with_retries(page)
+            await apply_scroll(page, SCROLL_COUNT)
             raw_products = await extract_products(page)
             return clean_with_pandas(raw_products)
         finally:
@@ -209,10 +272,10 @@ def send_to_webhook(json_path: Path) -> int:
         record_count = len(payload) if isinstance(payload, list) else 1
         logger.info("Posting %s record(s) to Make.com webhook", record_count)
 
+        secure_url = f"{WEBHOOK_URL}?api_key={MAKE_API_KEY}"
+
         response = requests.post(
-            WEBHOOK_URL,
-            json=payload,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            secure_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS
         )
         if response.status_code != 200:
             raise requests.HTTPError(

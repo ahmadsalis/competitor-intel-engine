@@ -1,0 +1,6 @@
+{
+  "target_url": "https://books.toscrape.com/",
+  "webhook_url": "https://hook.eu1.make.com/lct2apf0fzkpfhtsxpz28wc6433apian",
+  "scroll_count": 0,
+  "output_file_name": "competitor_data.json"
+}

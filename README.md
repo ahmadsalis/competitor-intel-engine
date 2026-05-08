@@ -55,7 +55,7 @@ flowchart LR
 ### 1. Clone the project
 
 ```bash
-git clone <your-repository-url>
+git clone https://github.com/ahmadsalis/competitor-intel-engine
 cd competitor-intel-engine
 ```
 
@@ -82,29 +82,32 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 4. Configure environment variables
+### 4. Configure `.env`
 
-For a production-ready setup, keep secrets and endpoints out of source code and provide them through environment variables instead.
+The scraper now loads secrets from a local `.env` file using `python-dotenv`.
 
-Recommended variables:
+Create or update `.env` with your real values:
 
-```bash
-WEBHOOK_URL=https://your-make-webhook-url
+```dotenv
+GEMINI_API_KEY=your-gemini-api-key
+PYTHONANYWHERE_SECRET_KEY=your-pythonanywhere-secret-key
+MAKE_API_KEY=your-make-api-key
 ```
 
-Example on Windows PowerShell:
+### 5. Configure `config.json`
 
-```powershell
-$env:WEBHOOK_URL="https://your-make-webhook-url"
+User-adjustable runtime settings now live in `config.json`:
+
+```json
+{
+  "target_url": "https://books.toscrape.com/",
+  "webhook_url": "https://your-make-webhook-url",
+  "scroll_count": 0,
+  "output_file_name": "competitor_data.json"
+}
 ```
 
-Example on macOS / Linux:
-
-```bash
-export WEBHOOK_URL="https://your-make-webhook-url"
-```
-
-### 5. Run the scraper
+### 6. Run the scraper
 
 ```bash
 python scraper.py
@@ -119,7 +122,7 @@ The script currently produces:
 
 ## 🔐 Configuration Notes
 
-The current script includes the webhook configuration directly in [scraper.py](</C:/Users/ahmad/Documents/competitor-intel-engine/scraper.py:25>). For client delivery or production deployment, the recommended next step is to load `WEBHOOK_URL` from environment variables instead of storing it in the repository.
+The scraper now reads secrets from [.env](</C:/Users/ahmad/Documents/competitor-intel-engine/.env:1>) and runtime settings from [config.json](</C:/Users/ahmad/Documents/competitor-intel-engine/config.json:1>). This keeps environment-specific values out of the main application logic in [scraper.py](</C:/Users/ahmad/Documents/competitor-intel-engine/scraper.py:1>).
 
 ## 💼 Ideal Use Cases
 
